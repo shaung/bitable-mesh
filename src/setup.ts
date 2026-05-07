@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import * as readline from 'node:readline';
 import { stdin as input, stdout as output } from 'node:process';
 import { getDomainConfig } from './domain.js';
+import { UserTokenProvider, loadStoredTokens } from './auth.js';
 
 // ---------------------------------------------------------------------------
 // Bitable field type constants
@@ -163,6 +164,41 @@ async function listTables(client: Client, appToken: string): Promise<TableInfo[]
     }
     if (!resp.data?.has_more) break;
     pageToken = (resp.data?.page_token as string) ?? null;
+  }
+  return tables;
+}
+
+// ---------------------------------------------------------------------------
+// List all tables using user token (no appSecret needed)
+// ---------------------------------------------------------------------------
+
+async function listTablesWithUserToken(appId: string, appToken: string, openApiDomain: string): Promise<TableInfo[]> {
+  const provider = UserTokenProvider.fromStore(appId);
+  if (!provider) {
+    throw new Error('Not logged in. Run setup with login or provide appSecret.');
+  }
+
+  const token = await provider.getToken();
+  const dc = getDomainConfig(openApiDomain);
+
+  const tables: TableInfo[] = [];
+  let pageToken: string | null = null;
+
+  for (let i = 0; i < 20; i++) {
+    const url = `https://${dc.open}/open-apis/bitable/v1/apps/${appToken}/tables?page_size=50${pageToken ? `&page_token=${pageToken}` : ''}`;
+    const resp = await fetch(url, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    const body = await resp.json() as any;
+    if (body.code !== 0) {
+      throw new Error(`List tables failed: ${JSON.stringify(body)}`);
+    }
+    const items = body.data?.items ?? [];
+    for (const item of items) {
+      tables.push({ table_id: item.table_id, name: item.name });
+    }
+    if (!body.data?.has_more) break;
+    pageToken = body.data?.page_token ?? null;
   }
   return tables;
 }
@@ -416,11 +452,35 @@ export async function interactiveSetup(profile = 'default'): Promise<void> {
   }
 
   // =========================================================================
-  // Step 3: Owner
+  // Step 3: OAuth PKCE Login
   // =========================================================================
 
-  // Step 3 removed — identity collected via `bitable-mesh login` (OAuth PKCE).
+  console.log('\nStep 3: Authorize Your Identity');
+  console.log('  OAuth login gives you access to your existing Bitables');
+  console.log('  and records your identity (open_id) in the profile.\n');
+
   let ownerOpenId = process.env.OWNER_OPEN_ID || undefined;
+
+  const existingTokens = loadStoredTokens(appId);
+  if (existingTokens?.userId) {
+    ownerOpenId = existingTokens.userId;
+    console.log(`  ✓ Already authorized as ${ownerOpenId}`);
+  } else {
+    const doLogin = await ask('  Authorize via browser now? [Y/n]: ');
+    if (doLogin.toLowerCase() !== 'n') {
+      try {
+        await UserTokenProvider.login(appId, openApiDomain);
+        const stored = loadStoredTokens(appId);
+        if (stored?.userId) {
+          ownerOpenId = stored.userId;
+          console.log(`  ✓ Authorized as ${ownerOpenId}`);
+        }
+      } catch (err: any) {
+        console.log(`  ⚠ Authorization failed: ${err.message}`);
+        console.log('  Continuing without identity. Table listing with appSecret may still work.\n');
+      }
+    }
+  }
 
   // =========================================================================
   // Step 4: Bitable mode
@@ -436,6 +496,11 @@ export async function interactiveSetup(profile = 'default'): Promise<void> {
 
   if (modeIdx === 0) {
     // -- Create new ---------------------------------------------------------
+    if (!appSecret) {
+      console.error('\n  Error: appSecret is required to create a new Bitable base.');
+      console.error('  Please re-run setup and provide appSecret, or choose "Use an existing Bitable base".');
+      return;
+    }
     console.log('');
     const meshName = await ask('  Name for the new base [bitable-mesh]: ');
     result = await createBitableMesh({
@@ -464,14 +529,32 @@ export async function interactiveSetup(profile = 'default'): Promise<void> {
 
     // List tables
     console.log('\n  Fetching tables...');
-    const client = createClient({ appId, appSecret, openApiDomain });
     let tables: TableInfo[];
-    try {
-      tables = await listTables(client, parsed.appToken);
-    } catch (err: any) {
-      console.error(`  Error: ${err.message}`);
-      console.error('  Make sure the app has access to this base and the URL is correct.');
-      return;
+    if (appSecret) {
+      const client = createClient({ appId, appSecret, openApiDomain });
+      try {
+        tables = await listTables(client, parsed.appToken);
+      } catch (err: any) {
+        console.error(`  Error: ${err.message}`);
+        console.error('  Make sure the app has access to this base and the URL is correct.');
+        return;
+      }
+    } else {
+      // No appSecret — use user token (OAuth PKCE)
+      const provider = UserTokenProvider.fromStore(appId);
+      if (!provider) {
+        console.error('  Error: No appSecret and no OAuth login found.');
+        console.error('  Please re-run setup and provide appSecret, or complete the authorization step.');
+        return;
+      }
+      try {
+        tables = await listTablesWithUserToken(appId, parsed.appToken, openApiDomain);
+      } catch (err: any) {
+        console.error(`  Error: ${err.message}`);
+        console.error('  Make sure you have access to this base. The user token from OAuth login');
+        console.error('  grants access to bases you can view in the Feishu/Lark client.');
+        return;
+      }
     }
 
     if (tables.length === 0) {
